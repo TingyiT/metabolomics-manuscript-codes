@@ -1,0 +1,837 @@
+---
+title: "Metabolomics_Codes"
+output: html_document
+date: "2026-06-01"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(readxl)
+library(omu)
+library(tidyverse)
+library(limma)
+library(vegan)
+library(ggpubr)
+library(dplyr)
+library(ggplot2)
+library(ibdplexus)
+library(stringr)
+library(pROC)
+library(Maaslin2)
+library(kableExtra)
+```
+
+
+## Read In
+```{r}
+setwd("/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/sparc-projects")
+# Chemical Info
+chem341 <- read_excel("2023-11-IBD Plexus SPARC CD stool Metabolon 341 samples Raw Data with Plexus Data.XLSX", sheet = "Chemical Annotation")
+
+# Batch normalized imputed data
+impt341 <- read_excel("2023-11-IBD Plexus SPARC CD stool Metabolon 341 samples Raw Data with Plexus Data.XLSX", sheet = "Batch-norm Imputed Data")
+
+# Metadata
+meta341 <- read_excel("2023-11-IBD Plexus SPARC CD stool Metabolon 341 samples Raw Data with Plexus Data.XLSX", sheet = "Sample Meta Data with Plexus")
+
+meta341 <- na.omit(meta341)
+impt341 <- impt341 %>% filter(PARENT_SAMPLE_NAME %in% meta341$PARENT_SAMPLE_NAME)
+
+# Select Metabolites info required
+chem341 <- chem341 %>% dplyr::select(CHEM_ID, CHEMICAL_NAME, KEGG)
+
+# Add to data
+process_omu_data <- function(count_data, chem_data) {
+
+  omu_data <- t(count_data)[-1, ]
+  colnames(omu_data) <- count_data$PARENT_SAMPLE_NAME
+  omu_data <- cbind(CHEM_ID = rownames(omu_data), omu_data)
+  rownames(omu_data) <- NULL
+  omu_data <- merge(chem_data, omu_data, by = "CHEM_ID")
+  omu_data <- omu_data[, -1]
+  colnames(omu_data)[1] <- "Metabolite"
+
+  omu_data <- omu_data%>%
+    mutate(across(where(is.character) & !c(Metabolite, KEGG), as.numeric))
+
+  return(omu_data)
+}
+
+omu_data341 <- process_omu_data(impt341, chem341)
+
+meta341 <- meta341 %>% dplyr::rename(Sample=PARENT_SAMPLE_NAME) %>% as.data.frame()
+
+# remove duplicates
+duplicated_rows <- read.csv("/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/S3_codes/outputs_metabolomic/duplicated_rows.csv")
+
+dup_ID <- duplicated_rows$DEIDENTIFIED_MASTER_PATIENT_ID %>% unique()  # duplicated_rows in Metabolomic_OMU.Rmd
+
+meta302 <- meta341 %>% filter(!DEIDENTIFIED_MASTER_PATIENT_ID %in% dup_ID)
+impt302 <- impt341 %>% filter(PARENT_SAMPLE_NAME %in% meta302$Sample)
+```
+
+#### clin data
+```{r}
+setwd("/storage1/fs1/caos/Active/Tingyi/Public/Deepak/SPARC/S3-clinical-data/2024-08-05_Full August/2024-08-05_Full August")
+
+clin_data <- read_excel("2024-08-05_SPARC_Full August_REPORTS.xlsx", sheet="SUMMARY_ENROLLMENT")
+
+clin_data_selected <- clin_data %>% dplyr::select(DEIDENTIFIED_MASTER_PATIENT_ID,
+                                           DISEASE_LOCATION,
+                                           CROHNS_DISEASE_PHENOTYPE,
+                                           EXTENT_OF_MACROSCOPIC_ULCERATIVE_COLITIS,
+                                           EXTENT_OF_MACROSCOPIC_IBD_UNCLASSIFIED,
+                                           DIAGNOSIS_DATE,
+                                           BIRTH_YEAR,
+                                           SEX,
+                                           DATE_OF_CONSENT,
+                                           DISEASE_ACTIVITY_60)
+# 302 unique patients
+clin_data_302 <- clin_data_selected %>%
+  filter(DEIDENTIFIED_MASTER_PATIENT_ID %in%
+           as.character(meta302$DEIDENTIFIED_MASTER_PATIENT_ID))
+
+# merge with sample metadata
+meta302$DEIDENTIFIED_MASTER_PATIENT_ID <- as.character(meta302$DEIDENTIFIED_MASTER_PATIENT_ID)
+
+merged_meta302 <- meta302 %>%
+  left_join(clin_data_302, by = "DEIDENTIFIED_MASTER_PATIENT_ID")
+
+# take earliest sample for each patient
+merged_meta302 <- merged_meta302 %>% group_by(DEIDENTIFIED_MASTER_PATIENT_ID) %>%
+  slice_min(Date_Sample_Collected, n = 1) %>%
+  ungroup()
+
+# relevel Phenotype (B2B3 -> B3)
+merged_meta302$CROHNS_DISEASE_PHENOTYPE <- ifelse(
+  merged_meta302$CROHNS_DISEASE_PHENOTYPE %in%
+    c("Both stricturing and penetrating (B2B3)", "Penetrating (B3)"),
+  "Penetrating (B3)",
+  merged_meta302$CROHNS_DISEASE_PHENOTYPE
+)
+
+table(merged_meta302$CROHNS_DISEASE_PHENOTYPE)
+
+# change samples
+impt302 <- impt302 %>% filter(PARENT_SAMPLE_NAME %in% merged_meta302$Sample)
+
+
+# Build count matrices (302) and set NA -> Unknown
+omu_data302 <- process_omu_data(impt302, chem341)
+
+omu_log302 <- log(omu_data302[,3:304])
+omu_log302 <- cbind(omu_data302[,1:2], omu_log302)
+
+merged_meta302 <- data.frame(merged_meta302)
+
+# Set NA as Unknown
+merged_meta302 <- merged_meta302 %>%
+  mutate(DISEASE_LOCATION = ifelse(is.na(DISEASE_LOCATION), "Unknown", DISEASE_LOCATION))
+
+merged_meta302 <- merged_meta302 %>%
+  mutate(CROHNS_DISEASE_PHENOTYPE = ifelse(is.na(CROHNS_DISEASE_PHENOTYPE), "Unknown",
+                                           CROHNS_DISEASE_PHENOTYPE))
+
+table(merged_meta302$DISEASE_LOCATION)
+```
+
+## PCA  -- Figure 2A
+```{r}
+# Adjust for disease activity
+
+# make sure metadata in same order as count data
+merged_meta302 <- merged_meta302[match(impt302$PARENT_SAMPLE_NAME,
+                                       merged_meta302$Sample), ]
+
+# modify count matrix
+omu_log302_matrix <- omu_log302[,-c(1,2)]
+
+# replace NA with Unknown
+merged_meta302 <- merged_meta302 %>%
+  mutate(DISEASE_ACTIVITY_60 = ifelse(is.na(DISEASE_ACTIVITY_60), "Unknown", DISEASE_ACTIVITY_60))
+table(merged_meta302$DISEASE_ACTIVITY_60)
+
+merged_meta302$DISEASE_ACTIVITY_60 <- as.factor(merged_meta302$DISEASE_ACTIVITY_60)
+omu_log302_matrix <- as.matrix(omu_log302_matrix)
+storage.mode(omu_log302_matrix) <- "numeric"
+rownames(omu_log302_matrix) <- NULL
+colnames(omu_log302_matrix) <- NULL
+
+design <- model.matrix(~ 1, data = merged_meta302)
+
+# Apply removeBatchEffect
+adjusted_data <- removeBatchEffect(
+  omu_log302_matrix,
+  batch = merged_meta302$DISEASE_ACTIVITY_60,
+  design = design
+) %>% as.data.frame()
+
+colnames(adjusted_data) <- colnames(omu_log302)[3:304]
+
+omu_log_adjusted <- cbind(omu_log302[, 1:2], adjusted_data)
+
+# rename phenotype levels
+merged_meta302$CROHNS_DISEASE_PHENOTYPE <- factor(merged_meta302$CROHNS_DISEASE_PHENOTYPE,
+     levels = c("Inflammatory non-penetrating, non-stricturing (B1)",
+                "Stricturing (B2)", "Penetrating (B3)", "Unknown"),
+     labels = c("B1", "B2", "B3", "Unknown"))
+
+# phenotype (Figure 2A)
+loc_pca <- PCA_plot(count_data = omu_log_adjusted, metadata = merged_meta302,
+         variable = "CROHNS_DISEASE_PHENOTYPE", color = "CROHNS_DISEASE_PHENOTYPE",
+         response_variable = "Metabolite")+ theme_bw()+
+  stat_ellipse(aes(group = CROHNS_DISEASE_PHENOTYPE, fill = CROHNS_DISEASE_PHENOTYPE),
+               geom = "polygon", alpha = 0.2, color = NA) +  # shaded ellipses
+  stat_ellipse(aes(group = CROHNS_DISEASE_PHENOTYPE, color = CROHNS_DISEASE_PHENOTYPE),
+               geom = "path") +  # outline of ellipses
+  theme(panel.grid = element_blank())+
+  labs(color = "CD Phenotype", fill = "CD Phenotype", shape = "CD Phenotype") +
+  ggtitle("Adjusted PCA Plot (Phenotype)")
+
+loc_pca
+```
+
+## Permanova 
+```{r}
+
+set.seed(1)
+
+# 1) sample x feature matrix, aligned with metadata
+samples <- colnames(omu_log_adjusted)[-(1:2)]
+X <- t(as.matrix(omu_log_adjusted[, -(1:2)]))   # rows = samples, cols = metabolites
+rownames(X) <- samples
+
+meta <- merged_meta302 |>
+  dplyr::filter(Sample %in% samples) |>
+  dplyr::arrange(match(Sample, samples))
+
+stopifnot(identical(rownames(X), meta$Sample))
+
+# drop Unknown groups
+keep <- meta$DISEASE_LOCATION != "Unknown" & meta$CROHNS_DISEASE_PHENOTYPE != "Unknown"
+X <- X[keep, , drop = FALSE]
+meta <- meta[keep, , drop = FALSE]
+
+meta$DISEASE_LOCATION <- droplevels(factor(meta$DISEASE_LOCATION))
+meta$CROHNS_DISEASE_PHENOTYPE <- droplevels(factor(meta$CROHNS_DISEASE_PHENOTYPE))
+
+# 2) distance matrix (Euclidean, consistent with log data / PCA)
+dist_euc <- vegdist(X, method = "euclidean")
+
+# 3) PERMANOVA: Location and Phenotype
+permanova_loc <- adonis2(dist_euc ~ DISEASE_LOCATION, data = meta,
+                         permutations = 1000, by = "margin")
+permanova_pheno <- adonis2(dist_euc ~ CROHNS_DISEASE_PHENOTYPE, data = meta,
+                           permutations = 1000, by = "margin")
+
+print(permanova_loc)
+print(permanova_pheno)
+
+# 4) Homogeneity of dispersion (PERMDISP - key PERMANOVA assumption)
+bd_loc   <- betadisper(dist_euc, meta$DISEASE_LOCATION)
+bd_pheno <- betadisper(dist_euc, meta$CROHNS_DISEASE_PHENOTYPE)
+
+cat("\n--- Homogeneity of dispersion (Location) ---\n")
+print(permutest(bd_loc))
+
+cat("\n--- Homogeneity of dispersion (Phenotype) ---\n")
+print(permutest(bd_pheno))
+
+
+## add super pathway
+
+chem341 <- read_excel("/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/sparc-projects/2023-11-IBD Plexus SPARC CD stool Metabolon 341 samples Raw Data with Plexus Data.XLSX", sheet = "Chemical Annotation")
+
+chem341 <- chem341 %>% dplyr::select(CHEMICAL_NAME, SUPER_PATHWAY,SUB_PATHWAY)
+chem341 <- dplyr::rename(chem341, Metabolite=CHEMICAL_NAME)
+# arrange Metabolites order
+chem341 <- chem341 %>%
+  arrange(match(Metabolite, omu_data302$Metabolite))
+
+# remove class NA and Partially characterized
+chem341 <- chem341 %>% filter(!is.na(SUPER_PATHWAY)|SUPER_PATHWAY!="Partially Characterized Molecules")
+
+# also remove from count data
+omu_data302 <- omu_data302 %>% filter(Metabolite %in% chem341$Metabolite)
+```
+
+# Phenotype   -- Figure 2B
+```{r}
+# Prepare long-format data
+kw_data <- omu_data302 %>%
+  pivot_longer(-c(Metabolite, KEGG), names_to = "Sample", values_to = "Abundance") %>%
+  left_join(merged_meta302[, c("Sample", "CROHNS_DISEASE_PHENOTYPE")], by = "Sample") %>%
+  filter(CROHNS_DISEASE_PHENOTYPE %in% c("B1", "B2", "B3"))
+
+# Run Kruskal-Wallis test and select top 20
+kw_results <- kw_data %>%
+  group_by(Metabolite) %>%
+  summarise(
+    p_value = kruskal.test(Abundance ~ CROHNS_DISEASE_PHENOTYPE)$p.value
+  ) %>%
+  mutate(adj_p = p.adjust(p_value, method = "BH")) %>%
+  arrange(adj_p)
+
+top20_metabolites <- kw_results %>%
+  arrange(adj_p) %>%
+  distinct(Metabolite, .keep_all = TRUE) %>%
+  slice_head(n = 20) %>%
+  pull(Metabolite)
+
+
+##### post-hoc wilcoxon (phenotype)
+pairwise_data <- kw_data %>%
+  filter(Metabolite %in% top20_metabolites)
+
+pairwise_results <- pairwise_data %>%
+  group_by(Metabolite) %>%
+  do({
+    test_res <- pairwise.wilcox.test(
+      x = .$Abundance,
+      g = .$CROHNS_DISEASE_PHENOTYPE,
+      p.adjust.method = "BH"
+    )
+    broom::tidy(test_res)
+  }) %>%
+  ungroup()
+
+pairwise_results$p.value <- ifelse(pairwise_results$p.value < 0.001,
+                                   "<0.001",
+                                   round(pairwise_results$p.value,3))
+
+```
+
+
+```{r, fig.width=26, fig.height=14}
+
+##### boxplot + post-hoc Wilcoxon
+p <- ggplot(kw_data %>% filter(Metabolite %in% top20_metabolites),
+            aes(x = CROHNS_DISEASE_PHENOTYPE,
+                y = Abundance,
+                fill = CROHNS_DISEASE_PHENOTYPE)) +
+  geom_boxplot(outlier.size = 0.8, width = 0.6) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.signif",
+    comparisons = list(c("B1", "B2"), c("B1", "B3"), c("B2", "B3")),
+    p.adjust.method = "BH",
+    hide.ns = FALSE
+  ) +
+  facet_wrap(~Metabolite, scales = "free_y", ncol = 5) +
+  labs(
+    title = "Top 20 Metabolites by CD Phenotype (post-hoc Wilcoxon tests)",
+    x = "CD Phenotype",
+    y = "Abundance",
+    fill="Phenotype"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x  = element_text(size = 0),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    plot.title   = element_text(size = 20, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 18),
+    legend.text  = element_text(size = 16),
+    strip.text   = element_text(size = 13)
+  )
+
+p
+
+#ggsave( filename = "/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/S3_codes/outputs_metabolomic/top20_metabolites_pheno_posthoc.png", plot = p, width = 29, height = 14, dpi = 300)
+```
+
+# Location -- Figure 3
+```{r}
+# Comparing colonic, ileal and ileocolonic
+kw_location <- omu_data302 %>%
+  pivot_longer(-c(Metabolite, KEGG), names_to = "Sample", values_to = "Abundance") %>%
+  left_join(merged_meta302[, c("Sample", "DISEASE_LOCATION")], by = "Sample") %>%
+  filter(DISEASE_LOCATION %in% c("Ileocolonic", "Colonic","Ileal"))
+
+# Run Kruskal-Wallis test
+location_results <- kw_location %>%
+  group_by(Metabolite) %>%
+  summarise(
+    p_value = kruskal.test(Abundance ~ DISEASE_LOCATION)$p.value
+  ) %>%
+  mutate(adj_p = p.adjust(p_value, method = "BH")) %>%
+  arrange(adj_p)
+
+top20_metabolites_location <- location_results %>%
+  arrange(adj_p) %>%
+  distinct(Metabolite, .keep_all = TRUE) %>%
+  slice_head(n = 20) %>%
+  pull(Metabolite)
+```
+
+### Figure 3A: boxplot
+```{r, fig.width=26, fig.height=14}
+
+#### After MaAsLin2, exclude ursodeoxycholate from location
+top20_metabolites_location <- setdiff(top20_metabolites_location, "ursodeoxycholate")
+
+# data for boxplot (no summarise)
+boxplot_location <- kw_location %>%
+  filter(Metabolite %in% top20_metabolites_location) %>%
+  left_join(location_results %>% dplyr::select(Metabolite, adj_p), by = "Metabolite") %>%
+  mutate(label_p = paste0("p = ", formatC(adj_p, format = "e", digits = 2)))
+
+# p-value label position per metabolite
+p_labels <- boxplot_location %>%
+  group_by(Metabolite) %>%
+  summarise(
+    y_pos   = max(Abundance, na.rm = TRUE) * 1.1,
+    label_p = dplyr::first(label_p),
+    .groups = "drop"
+  )
+
+
+##### post-hoc wilcoxon (location)
+pairwise_location <- kw_location %>%
+  filter(Metabolite %in% top20_metabolites_location)
+
+pairwise_location_results <- pairwise_location %>%
+  group_by(Metabolite) %>%
+  do({
+    test_res <- pairwise.wilcox.test(
+      x = .$Abundance,
+      g = .$DISEASE_LOCATION,
+      p.adjust.method = "BH"
+    )
+    broom::tidy(test_res)
+  }) %>%
+  ungroup()
+
+pairwise_location_results$p.value <- ifelse(pairwise_location_results$p.value < 0.001,
+                                   "<0.001",
+                                   round(pairwise_location_results$p.value,3))
+
+
+p <- ggplot(kw_location %>% filter(Metabolite %in% top20_metabolites_location),
+            aes(x = DISEASE_LOCATION,
+                y = Abundance,
+                fill = DISEASE_LOCATION)) +
+  geom_boxplot(outlier.size = 0.8, width = 0.6) +
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.signif",
+    comparisons = list(c("Colonic", "Ileocolonic"), c("Colonic", "Ileal"), c("Ileocolonic", "Ileal")),
+    p.adjust.method = "BH",
+    hide.ns = FALSE
+  ) +
+  facet_wrap(~Metabolite, scales = "free_y", ncol = 5) +
+  labs(
+    title = "Top 19 Metabolites by Disease Location (post-hoc Wilcoxon tests)",
+    x = "Location",
+    y = "Abundance",
+    fill="Location"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x  = element_text(size = 0),
+    axis.text.y  = element_text(size = 12),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    plot.title   = element_text(size = 20, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 18),
+    legend.text  = element_text(size = 16),
+    strip.text   = element_text(size = 13)
+  )
+
+p
+#ggsave( filename = "/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/S3_codes/outputs_metabolomic/top20_metabolites_loc_posthoc.png", plot = p, width = 29, height = 14, dpi = 300)
+```
+
+# Fecal disease activity -- Figure 1A
+```{r}
+# Fecal calprotectin (closest value per patient)
+
+#emr_labs <- load_data(datadir = "/storage1/fs1/caos/Active/Tingyi/Public/Deepak/SPARC/S3-clinical-data/2025-02-17_Full Cohort February/2025-02-17_Full Cohort February/data/SPARC/", cohort = "SPARC", domains = "labs", data_type = "EMR")
+#fcal = extract_lab_emr(data=emr_labs,labtype="FCAL",codetype="ALL")
+
+fcal_selected <- fcal %>% filter(DEIDENTIFIED_MASTER_PATIENT_ID %in% merged_meta302$DEIDENTIFIED_MASTER_PATIENT_ID) %>%
+  mutate(SPECIMEN_COLLECTION_DATE = as.Date(SPECIMEN_COLLECTION_DATE, format = "%d-%b-%Y"))
+
+# keep fcal closest to metabolomic date
+metabolite_date <- merged_meta302 %>% dplyr::select(DEIDENTIFIED_MASTER_PATIENT_ID, Sample, Date_Sample_Collected)
+metabolite_date$Date_Sample_Collected <- as.Date(metabolite_date$Date_Sample_Collected)
+
+closest_fcal <- fcal_selected %>%
+  left_join(metabolite_date, by = "DEIDENTIFIED_MASTER_PATIENT_ID") %>%
+  filter(!is.na(LAB_RESULTS)) %>%
+  mutate(
+    diff_days = as.integer(SPECIMEN_COLLECTION_DATE - Date_Sample_Collected),
+    abs_diff  = abs(diff_days)
+  ) %>%
+  group_by(DEIDENTIFIED_MASTER_PATIENT_ID) %>%
+  slice_min(order_by = abs_diff, n = 1) %>%
+  ungroup()
+
+length(unique(closest_fcal$DEIDENTIFIED_MASTER_PATIENT_ID))
+
+closest_fcal <- closest_fcal %>% dplyr::select(DEIDENTIFIED_MASTER_PATIENT_ID, Sample,
+                               LAB_RESULTS,TEST_UNIT,SPECIMEN_COLLECTION_DATE) %>% unique()
+
+closest_fcal <- closest_fcal %>%
+  mutate(
+    fcal_value = str_replace_all(LAB_RESULTS, "[<>]", ""),
+    fcal_value = as.numeric(fcal_value)
+  )
+
+closest_fcal <- closest_fcal %>%
+  mutate(fcal_log = log1p(fcal_value))  # log(1 + fcal)
+
+# Fecal disease activity (>=100 ug/g) 
+kw_fcal_activity <- omu_data302 %>%
+  pivot_longer(-c(Metabolite, KEGG), names_to = "Sample", values_to = "Abundance") %>%
+  left_join(closest_fcal[, c("Sample", "fcal_value")], by = "Sample") %>%
+  filter(!is.na(fcal_value)) %>%
+  mutate(fcal_disease_activity = ifelse(fcal_value >=100, "active", "inactive"))
+
+# Run Kruskal-Wallis test
+fcal_activity_results <- kw_fcal_activity %>%
+  group_by(Metabolite) %>%
+  summarise(
+    p_value = kruskal.test(Abundance ~ fcal_disease_activity)$p.value
+  ) %>%
+  mutate(adj_p = p.adjust(p_value, method = "BH")) %>%
+  arrange(adj_p)
+
+# all significant metabolites (n = 9 in manuscript)
+top_metabolites_fcal_activity <- fcal_activity_results %>%
+  arrange(adj_p) %>%
+  distinct(Metabolite, .keep_all = TRUE) %>%
+  filter(adj_p <0.05) %>%
+  pull(Metabolite)
+```
+
+### Figure 1A: boxplot
+```{r, fig.width=26, fig.height=8}
+plot_fcal_activity_long <- kw_fcal_activity %>%
+  filter(Metabolite %in% top_metabolites_fcal_activity) %>%
+  left_join(
+    fcal_activity_results %>% dplyr::select(Metabolite, adj_p),
+    by = "Metabolite"
+  ) %>%
+  mutate(label_p = paste0("p = ", formatC(adj_p, format = "e", digits = 2)))
+
+p_labels <- plot_fcal_activity_long %>%
+  group_by(Metabolite) %>%
+  summarise(
+    y_pos = max(Abundance, na.rm = TRUE) * 1.05,
+    label_p = dplyr::first(label_p),
+    .groups = "drop"
+  )
+
+p <- ggplot(
+  plot_fcal_activity_long,
+  aes(x = fcal_disease_activity, y = Abundance, fill = fcal_disease_activity)
+) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.15, size = 0.6, alpha = 0.5) +
+  geom_text(
+    data = p_labels,
+    aes(x = 1.5, y = y_pos, label = label_p),
+    inherit.aes = FALSE,
+    size = 5,
+    fontface = "bold",
+    color = "black"
+  ) +
+  facet_wrap(~ Metabolite, scales = "free_y", ncol = 5) +
+  theme_bw() +
+  labs(
+    title = "Significant Metabolites by Fecal Disease Activity",
+    x = "Fecal Disease Activity",
+    y = "Abundance",
+    fill = "Activity"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 0),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 16),
+    strip.text = element_text(size = 14)
+  )
+
+p
+# ggsave(filename = "/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/S3_codes/outputs_metabolomic/top_fcal_activity_metabolites_box.png",plot = p, width = 29, height = 8, dpi = 300)
+```
+
+# ROC  -- Figures 1B and 2C
+```{r}
+
+# long abundance + phenotype labels
+abun_long <- omu_data302 %>%
+  pivot_longer(-c(Metabolite, KEGG), names_to = "Sample", values_to = "Abundance")
+
+meta_labels <- merged_meta302 %>%
+  dplyr::select(Sample, CROHNS_DISEASE_PHENOTYPE, GROUP_NAME2) %>%
+  filter(CROHNS_DISEASE_PHENOTYPE %in% c("B1", "B2", "B3"))
+
+## ---- Phenotype: top 20 metabolites, B1 vs others ----
+top_pheno <- kw_results %>%
+  arrange(adj_p) %>%
+  slice_head(n = 20) %>%
+  pull(Metabolite)
+
+roc_pheno_df <- abun_long %>%
+  filter(Metabolite %in% top_pheno) %>%
+  left_join(meta_labels, by = "Sample") %>%
+  mutate(label_B1 = ifelse(CROHNS_DISEASE_PHENOTYPE == "B1", 1, 0))
+
+## ---- Disease activity: 9 significant (fecal) metabolites ----
+top_activity <- fcal_activity_results %>%
+  filter(adj_p < 0.05) %>%
+  arrange(adj_p) %>%
+  pull(Metabolite)
+
+roc_act_df <- abun_long %>%
+  filter(Metabolite %in% top_activity) %>%
+  left_join(meta_labels, by = "Sample") %>%
+  filter(!is.na(GROUP_NAME2)) %>%
+  mutate(label_active = ifelse(GROUP_NAME2 == "Active_CD", 1, 0))
+```
+
+### Figure 1B: disease activity
+```{r}
+combo_df <- roc_act_df %>%
+  group_by(Sample) %>%
+  summarise(mean_abun = mean(Abundance, na.rm = TRUE)) %>%
+  left_join(unique(roc_act_df[, c("Sample", "label_active")]), by = "Sample")
+
+roc_combo <- roc(combo_df$label_active, combo_df$mean_abun)
+
+pROC::plot.roc(roc_combo, lwd=2, main="Combined ROC for Disease Activity")
+legend("bottomright",
+       legend = paste0("AUC = ", round(auc(roc_combo), 3)),
+       bty = "n", cex = 1.2)
+
+#png("/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/S3_codes/outputs_metabolomic/ROC_Activity_9_combined.png", width = 7, height = 5, units = "in", res = 300)
+#pROC::plot.roc(roc_combo, lwd=2, main="Combined ROC for Disease Activity")
+#legend("bottomright", legend = paste0("AUC = ", round(auc(roc_combo), 3)), bty = "n", cex = 1.2)
+#dev.off()
+```
+
+### Figure 2C: phenotype
+```{r}
+combo_pheno_df <- roc_pheno_df %>%
+  group_by(Sample) %>%
+  summarise(mean_abun = mean(Abundance, na.rm = TRUE)) %>%
+  left_join(unique(roc_pheno_df[, c("Sample", "label_B1")]), by = "Sample")
+
+roc_pheno_combo <- roc(combo_pheno_df$label_B1, combo_pheno_df$mean_abun)
+
+pROC::plot.roc(roc_pheno_combo, lwd = 2,
+     main = "Combined ROC for Disease Phenotype (B1 vs. B2+B3)")
+legend("bottomright",
+       legend = paste0("AUC = ", round(auc(roc_pheno_combo), 3)),
+       bty = "n", cex = 1.2)
+
+#png("/storage1/fs1/caos/Active/Tingyi/Public/Deepak/S3_browser/S3_codes/outputs_metabolomic/ROC_Phenotype_Top20_combined.png", width = 7, height = 5, units = "in", res = 300)
+#pROC::plot.roc(roc_pheno_combo, lwd = 2, main = "Combined ROC for Disease Phenotype (B1 vs. B2+B3)")
+#legend("bottomright", legend = paste0("AUC = ", round(auc(roc_pheno_combo), 3)), bty = "n", cex = 1.2)
+#dev.off()
+```
+
+# Validation: MaAsLin2
+
+### Location
+```{r}
+
+kw_location_top <- kw_location %>%
+  dplyr::select(Sample, Metabolite, Abundance, DISEASE_LOCATION)
+
+# feature table: rows = Sample, cols = Metabolite
+feat_loc_tbl <- kw_location_top %>%
+  dplyr::select(Sample, Metabolite, Abundance) %>%
+  tidyr::pivot_wider(
+    names_from  = Metabolite,
+    values_from = Abundance,
+    values_fill = NA
+  )
+feat_loc <- feat_loc_tbl %>%
+  tibble::column_to_rownames("Sample") %>%
+  as.data.frame(check.names = FALSE)
+
+orig_features_loc <- colnames(feat_loc)
+feature_map_loc <- tibble::tibble(
+  feature_original  = orig_features_loc,
+  feature_sanitized = make.names(orig_features_loc, unique = TRUE)
+)
+colnames(feat_loc) <- feature_map_loc$feature_sanitized
+
+merged_meta302 <- merged_meta302 %>% mutate(age = year(Date_Sample_Collected) - BIRTH_YEAR)
+
+# metadata: rows = Sample
+meta_loc <- merged_meta302 %>%
+  dplyr::select(Sample, DISEASE_LOCATION, age, SEX) %>%
+  distinct(Sample, .keep_all = TRUE) %>%
+  tibble::column_to_rownames("Sample")
+meta_loc$DISEASE_LOCATION <- factor(meta_loc$DISEASE_LOCATION)
+
+# align samples
+common_ids <- intersect(rownames(feat_loc), rownames(meta_loc))
+feat_loc <- feat_loc[common_ids, , drop = FALSE]
+meta_loc <- meta_loc[common_ids, , drop = FALSE]
+
+# run MaAsLin2
+out_dir <- "maaslin2_location_top20"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+fit_loc <- Maaslin2(
+  input_data      = feat_loc,
+  input_metadata  = meta_loc,
+  output          = out_dir,
+  fixed_effects   = c("DISEASE_LOCATION","age","SEX"),
+  random_effects  = NULL,
+  normalization   = "NONE",
+  transform       = "LOG",
+  analysis_method = "LM",
+  correction      = "BH",
+  plot_scatter = FALSE,
+  plot_heatmap=FALSE
+)
+
+# results: location term only
+res_all <- read.delim(file.path(out_dir, "all_results.tsv"), stringsAsFactors = FALSE)
+
+res_location <- res_all %>%
+  dplyr::filter(metadata == "DISEASE_LOCATION") %>%
+  dplyr::left_join(feature_map_loc, by = c("feature" = "feature_sanitized")) %>%
+  dplyr::arrange(qval)
+
+sig_location <- res_location %>% filter(qval < 0.05)
+
+res_location
+sig_location %>% arrange(pval)
+
+newtop20_loc <- sig_location %>% arrange(pval) %>% slice_head(n=20) %>% pull(feature_original)
+setdiff(top20_metabolites_location, newtop20_loc)
+```
+
+### Phenotype
+```{r}
+kw_pheno_top <- kw_data %>%
+  dplyr::select(Sample, Metabolite, Abundance, CROHNS_DISEASE_PHENOTYPE)
+
+# feature table: rows = Sample, cols = Metabolite
+feat_pheno_tbl <- kw_pheno_top %>%
+  dplyr::select(Sample, Metabolite, Abundance) %>%
+  tidyr::pivot_wider(
+    names_from  = Metabolite,
+    values_from = Abundance,
+    values_fill = NA
+  )
+feat_pheno <- feat_pheno_tbl %>%
+  tibble::column_to_rownames("Sample") %>%
+  as.data.frame(check.names = FALSE)
+
+orig_features <- colnames(feat_pheno)
+feature_map <- tibble::tibble(
+  feature_original  = orig_features,
+  feature_sanitized = make.names(orig_features, unique = TRUE)
+)
+
+# metadata: rows = Sample (B1/B2/B3 only)
+meta_pheno <- merged_meta302 %>%
+  dplyr::select(Sample, CROHNS_DISEASE_PHENOTYPE, age, SEX) %>%
+  dplyr::filter(CROHNS_DISEASE_PHENOTYPE %in% c("B1", "B2", "B3")) %>%
+  dplyr::distinct(Sample, .keep_all = TRUE) %>%
+  tibble::column_to_rownames("Sample")
+
+meta_pheno$CROHNS_DISEASE_PHENOTYPE <- factor(
+  meta_pheno$CROHNS_DISEASE_PHENOTYPE,
+  levels = c("B1", "B2", "B3")  # B1 reference
+)
+
+# align samples
+common_ids <- intersect(rownames(feat_pheno), rownames(meta_pheno))
+feat_pheno <- feat_pheno[common_ids, , drop = FALSE]
+meta_pheno <- meta_pheno[common_ids, , drop = FALSE]
+
+# run MaAsLin2
+out_dir_pheno <- "maaslin2_phenotype_top20"
+dir.create(out_dir_pheno, showWarnings = FALSE, recursive = TRUE)
+
+fit_pheno <- Maaslin2(
+  input_data      = feat_pheno,
+  input_metadata  = meta_pheno,
+  output          = out_dir_pheno,
+  fixed_effects   = c("CROHNS_DISEASE_PHENOTYPE","age","SEX"),
+  random_effects  = NULL,
+  normalization   = "NONE",
+  transform       = "LOG",
+  analysis_method = "LM",
+  correction      = "BH",
+  plot_scatter = FALSE,
+  plot_heatmap=FALSE
+)
+
+# results: phenotype term only
+res_all_pheno <- read.delim(
+  file.path(out_dir_pheno, "all_results.tsv"),
+  stringsAsFactors = FALSE
+)
+
+res_pheno <- res_all_pheno %>%
+  dplyr::filter(metadata == "CROHNS_DISEASE_PHENOTYPE") %>%
+  dplyr::left_join(feature_map, by = c("feature" = "feature_sanitized")) %>%
+  dplyr::arrange(qval)
+
+sig_pheno <- res_pheno %>%
+  dplyr::filter(qval < 0.05)
+
+res_pheno
+sig_pheno
+
+setdiff(top20_metabolites, sig_pheno$feature_original)
+```
+
+# Table One  -- Table 1
+```{r}
+# Prepare Data
+tbl1_data <- clin_data_302 %>%
+  dplyr::select(-c(DISEASE_ACTIVITY_60,
+                   EXTENT_OF_MACROSCOPIC_ULCERATIVE_COLITIS,
+                   EXTENT_OF_MACROSCOPIC_IBD_UNCLASSIFIED))
+tbl1_data$AGE_AT_DIAGNOSIS <- tbl1_data$DIAGNOSIS_DATE - tbl1_data$BIRTH_YEAR
+
+tbl1_data$DATE_OF_CONSENT <- as.Date(tbl1_data$DATE_OF_CONSENT )
+tbl1_data$AGE_AT_ENROLLMENT <- as.numeric(year(tbl1_data$DATE_OF_CONSENT)) -
+  tbl1_data$BIRTH_YEAR
+
+tbl1_data <- tbl1_data %>% dplyr::select(-DATE_OF_CONSENT)
+
+## relevel
+tbl1_data$CROHNS_DISEASE_PHENOTYPE <- factor(tbl1_data$CROHNS_DISEASE_PHENOTYPE,
+     levels = c("Inflammatory non-penetrating, non-stricturing (B1)",
+                "Stricturing (B2)", "Penetrating (B3)",
+                "Both stricturing and penetrating (B2B3)", "Unknown"),
+     labels = c("B1", "B2", "B3", "B2B3", NA))
+tbl1_data$DISEASE_LOCATION <- ifelse(tbl1_data$DISEASE_LOCATION=="Unknown", NA, tbl1_data$DISEASE_LOCATION)
+
+# Create Tbl1
+allVars <- setdiff(colnames(tbl1_data), c("DEIDENTIFIED_MASTER_PATIENT_ID",
+                                          "DIAGNOSIS_DATE",
+                                          "BIRTH_YEAR"))
+
+contVars <- c("AGE_AT_DIAGNOSIS", "AGE_AT_ENROLLMENT")
+catVars <- setdiff(allVars, contVars)
+
+library(tableone)
+tbl1 <- CreateTableOne(vars = allVars,
+                        data = tbl1_data, factorVars = catVars,
+                        test = FALSE, includeNA=TRUE)
+
+x <- print(tbl1, showAllLevels = TRUE,  noSpaces = TRUE,
+           nonnormal = contVars)
+
+
+kable(x, format = "html") %>%
+  kable_styling(full_width = TRUE, bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
